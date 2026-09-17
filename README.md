@@ -71,6 +71,13 @@ instance of that category — not per-instance descriptions
 
 - **Seed** — single default `Config.seed = 42`; each simulator worker derives
   its RNG as `seed + worker_id`.
+- **Checkpoint** — all reported numbers come from the **final** checkpoint
+  (`checkpoint_final.pth`), not a best-on-validation selection.
+- **Parameters** — the trainable policy totals **7.78M** (spatial CNN
+  ~0.9M, projections ~0.3M, episodic memory ~0.3M, 2-layer GRU ~6.0M, actor +
+  critic heads ~0.3M); frozen DINOv2 ViT-B/14 (~87M) and CLIP ViT-B/32
+  (~151M incl. the text tower used for ObjectNav prompts) sit outside the
+  policy, so **< 4% of the full model is trained**.
 - **Training** — 10M environment steps; max-steps curriculum 150 → 500 over
   the first 3M steps (see [Configuration](#configuration)).
 - **Evaluation** — each validation episode is visited once per task; metrics
