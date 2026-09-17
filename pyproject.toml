@@ -1,0 +1,75 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "see2seek"
+version = "0.1.0"
+description = "DINOv2-based zero-shot object navigation in RoboTHOR: frozen DINOv2 + CLIP encoders with a recurrent PPO policy and episodic spatial memory"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Utsab Dahal", email = "utsabdahal34@gmail.com" }]
+keywords = [
+    "embodied-ai",
+    "reinforcement-learning",
+    "ppo",
+    "navigation",
+    "robothor",
+    "zero-shot",
+    "dinov2",
+    "clip",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.0.0",
+    "torchvision>=0.15.0",
+    "open_clip_torch>=2.20.0",
+    "ai2thor>=4.3.0",
+    "Pillow>=9.0.0",
+    "numpy>=1.24.0",
+    "tqdm>=4.65.0",
+    "wandb>=0.15.0",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "ruff==0.16.7",
+    "black==26.5.1",
+    "mypy==1.14.1",
+    "pre-commit>=3.5",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["see2seek*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+src = ["see2seek", "scripts", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["E203", "E501"]
+
+[tool.black]
+line-length = 100
+target-version = ["py39"]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["see2seek", "tests"]
+ignore_missing_imports = true
+warn_unused_ignores = true
+check_untyped_defs = true
