@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.coverage.*
+
+# Environments
+.venv/
+venv/
+env/
+minorenv/
+
+# Simulation / dataset artifacts
+dataset/
+imagenav_dataset/
+data*/
+data
+data_new
+data_new_dr
+data_clip
+augment_dataset
+logs/
+wandb/
+videos/
+birds_eye_views/
+birds_eye_views_with_paths/
+imgs/
+goals/
+embeddings.pt
+*.pth
+
+# Notebooks / scratch
+test.ipynb
+test.py
+scratch/
+
+# Editors / tooling
+.idea/
+.vscode/
+.claude/
+.DS_Store
+
+# CI / tooling must stay tracked
+!.github/
+
+# Tests must stay tracked
+!tests/

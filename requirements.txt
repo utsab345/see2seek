@@ -1,0 +1,14 @@
+# Top-level runtime dependencies for See2Seek.
+# Pin exact versions for reproducible research runs; the dev toolchain lives in
+# pyproject.toml ([project.optional-dependencies].dev).
+ai2thor==5.0.0
+ai2thor-colab==0.1.2
+numpy==1.26.4
+open_clip_torch>=2.20.0
+Pillow>=10.0.0
+torch==2.5.1
+torchvision==0.20.0
+tqdm>=4.65.0
+wandb>=0.15.0
+PyYAML==6.0.1
+gym==0.26.2
