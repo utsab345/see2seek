@@ -276,6 +276,12 @@ circle = successful stop, red circle = failed stop.
 - [CLIP: Learning Transferable Visual Models From Natural Language Supervision](https://arxiv.org/abs/2103.00020)
 - [RoboTHOR: An Open Simulation-to-Real Embodied AI Platform](https://arxiv.org/abs/2004.06799)
 
+## Team
+
+- Abiral Panta
+- Dipin Adhikari
+- Utsab Dahal
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
