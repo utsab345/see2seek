@@ -1,0 +1,945 @@
+"""
+Wraps AI2-THOR's Controller into a standard gym.Env interface with:
+    - Discrete action space (MoveAhead, RotateLeft, RotateRight, Stop)
+    - Geodesic-distance-based dense reward shaping
+    - Automatic episode reset with goal image embedding loading
+
+Episode structure:
+    Each episode has:
+        - A start position / rotation for the agent
+        - A goal image embedding(pre-cached)
+        - Success if the agent calls Stop within `success_distance` of goal
+
+Reward structure:
+    r_t = Δ(geodesic_distance) * scale + slack_reward
+    r_T = success_reward  (if Stop is called and agent is at goal)
+    r_T = 0               (if Stop is called but agent is not at goal)
+
+    Geodesic-distance delta reward encourages movement toward the goal
+    rather than rewarding visual similarity (which is encoded separately
+    in the observation embedding).
+
+Usage:
+    env = RoboTHOREnv(cfg)
+    obs_dict = env.reset()
+    obs_dict, reward, done, info = env.step(action_int)
+    env.close()
+
+Resilience note (bad-spawn episodes):
+    A small fraction of pre-generated RoboTHOR episodes have starting
+    poses (position/rotation) that collide with static objects in the
+    scene (e.g. a BaseballBat, a wall panel, etc.). AI2-THOR's
+    TeleportFull will refuse these placements and return
+    lastActionSuccess=False. reset() retries with the next episode (up
+    to `_max_reset_retries` times) instead of crashing, and only raises
+    once retries are exhausted — which would indicate a systemic
+    problem, not a single bad episode.
+
+Resilience note (Unity/controller crash mid-episode — added):
+    The AI2-THOR "controller" is really a thin RPC client talking to a
+    separate Unity subprocess over a FIFO pipe. If that Unity process
+    dies (commonly from GPU/VRAM pressure on smaller cards, but also
+    just occasional engine instability over long runs), the *next*
+    write to the pipe raises a low-level BrokenPipeError/OSError deep
+    inside ai2thor's fifo_server — not a clean AI2-THOR exception.
+    Previously this propagated all the way up through step(), through
+    the worker process, and killed the whole training run.
+
+    step() now wraps the underlying controller calls and, on detecting
+    a dead pipe/controller, tears down and restarts the Controller
+    (_restart_controller) and starts a fresh episode via reset(),
+    rather than letting the exception kill the worker. The returned
+    transition is marked done=True with reward 0.0 and
+    info["controller_crashed"]=True so the trainer's rollout/GAE logic
+    treats it as a normal episode boundary (bootstrapping is not
+    affected by a mid-episode crash-restart).
+"""
+
+from __future__ import annotations
+
+import gzip
+import json
+import logging
+import os
+import random
+import time
+from typing import Any
+
+import numpy as np
+import torch
+from ai2thor.util.metrics import path_distance
+from PIL import Image
+from torchvision import transforms
+
+logger = logging.getLogger(__name__)
+
+# ===========================================================================
+# Action map
+# ===========================================================================
+ACTIONS = {
+    0: "MoveAhead",
+    1: "RotateLeft",
+    2: "RotateRight",
+    3: "Stop",
+}
+
+# Exceptions that indicate the Unity subprocess / IPC pipe backing the
+# AI2-THOR controller has died, rather than a normal in-sim action failure
+# (those are reported via event.metadata["lastActionSuccess"], not raised).
+_CONTROLLER_DEAD_EXCEPTIONS = (BrokenPipeError, ConnectionError, EOFError, OSError)
+
+
+class InvalidEpisodeStart(RuntimeError):
+    """A dataset start pose rejected by TeleportFull during evaluation."""
+
+    def __init__(self, episode: dict, reason: str, shortest_path_length: float):
+        super().__init__(reason)
+        self.info = {
+            "episode_id": episode["id"],
+            "scene_id": episode["scene"],
+            "reason": reason,
+            "shortest_path_length": round(shortest_path_length, 3),
+        }
+
+
+class ControllerCrashError(RuntimeError):
+    """Raised internally when the AI2-THOR/Unity backend has died and could
+    not be recovered within a single episode's controller restart."""
+
+
+# ===========================================================================
+# Environment
+# ===========================================================================
+class RoboTHOREnv:
+    """
+    Single-process RoboTHOR environment optimized for Pre-cached CLIP Embeddings.
+
+    Args:
+        cfg:        configs.config.Config — full project config.
+        episode_ids: Optional list of episode IDs to restrict execution.
+        worker_id:  Integer offset for AI2-THOR server port management.
+        render:     If True, render frames to screen (slow, for debugging).
+    """
+
+    # Max number of consecutive bad episodes we'll skip past in reset()
+    # before giving up and raising. A handful of collision-spawn episodes
+    # in a row is expected occasionally; hundreds in a row means something
+    # else is wrong (bad dataset path, corrupted episode file, etc).
+    _max_reset_retries: int = 20
+
+    # Max number of times we'll restart a dead Unity controller within a
+    # single step() call before giving up and raising ControllerCrashError.
+    # Restarting Unity is expensive (~seconds), so this is intentionally
+    # small — repeated failures back-to-back mean something systemic
+    # (e.g. GPU OOM that a fresh process will hit again immediately).
+    _max_controller_restarts: int = 3
+
+    def __init__(
+        self,
+        cfg,
+        episode_ids: list[str] | None = None,
+        worker_id: int = 0,
+        render: bool = False,
+        episodes: list[dict] | None = None,
+        goal_embeddings: dict[str, torch.Tensor] | None = None,
+    ) -> None:
+        self.cfg = cfg
+        self._worker_id = worker_id
+        self._render = render
+        self._evaluation = episodes is not None
+        self._text_goals = goal_embeddings
+        self._rng = random.Random(cfg.seed + worker_id)
+
+        # Observation space transform (only applied to the agent's live camera feed)
+        self._transform = transforms.Compose(
+            [
+                transforms.Resize((cfg.env.image_height, cfg.env.image_width)),
+                transforms.ToTensor(),
+            ]
+        )
+
+        # 1. Grab split dynamically from config
+        self._split = cfg.env.split
+
+        # 2. Load the pre-cached embeddings dictionary map (.pt)
+        # scene_dataset_path IS the split folder (e.g. .../imagenav_dataset/debug)
+        embeddings_path = os.path.join(cfg.env.scene_dataset_path, "embeddings.pt")
+
+        if goal_embeddings is not None:
+            self._embeddings_registry = goal_embeddings
+        elif os.path.exists(embeddings_path):
+            logger.info(f"📂 Loading cached CLIP embeddings registry from: {embeddings_path}")
+            self._embeddings_registry = torch.load(embeddings_path, map_location="cpu")
+        else:
+            raise FileNotFoundError(
+                f"❌ Required pre-cached embeddings file missing at: {embeddings_path}"
+            )
+
+        # 3. Load episodes. episodes_path may point at:
+        #      - a single .json / .json.gz file, OR
+        #      - a directory containing one or more per-scene files
+        #    (see _load_episodes for directory-handling / de-dup logic)
+        self._episodes: list[dict] = (
+            episodes
+            if episodes is not None
+            else self._load_episodes(cfg.env.episodes_path, episode_ids)
+        )
+
+        self._episode_index: int = 0
+        if not self._evaluation:
+            self._rng.shuffle(self._episodes)
+
+        # Current episode state variables
+        self._current_episode: dict | None = None
+        self._cached_goal_embedding: torch.Tensor | None = None
+        self._prev_geodesic_dist: float = 0.0
+        self._prev_angle_to_goal: float = 0.0  # angle diff to goal heading (degrees)
+        self._goal_heading: float = 0.0  # optimal_goal_pose rotation
+        self._num_steps: int = 0
+        self._episode_collisions: int = 0
+
+        # Exploration tracking: visited grid cells this episode
+        self._visited_cells: set = set()
+        self._exploration_bonus: float = cfg.env.exploration_bonus
+        self._cell_size: float = cfg.env.exploration_cell_size
+
+        # Curriculum: effective max_steps (updated by trainer)
+        self._effective_max_steps: int = cfg.env.max_steps
+
+        # Lazy-initialise AI2-THOR backend controller
+        self._controller: Any = None
+        self._init_controller()
+
+        logger.info(
+            f"✔ RoboTHOREnv[{worker_id}] initialized successfully — {len(self._episodes)} episodes running."
+        )
+
+    def _init_controller(self) -> None:
+        """Start the AI2-THOR Unity engine backend wrapper.
+
+        Attempts GPU-accelerated CloudRendering first. If the Vulkan
+        render server fails to produce a frame (e.g. missing NVIDIA
+        Vulkan ICD — llvmpipe fallback can't render AI2-THOR scenes),
+        falls back to the default CPU renderer automatically.
+        """
+        try:
+            from ai2thor.controller import Controller
+            from ai2thor.platform import CloudRendering
+        except ImportError as e:
+            raise ImportError("ai2thor is required: pip install ai2thor") from e
+
+        base_kwargs = dict(
+            agentMode="locobot",
+            visibilityDistance=1.5,
+            gridSize=self.cfg.env.move_magnitude,
+            rotateStepDegrees=self.cfg.env.rotate_degrees,
+            snapToGrid=False,
+            renderDepthImage=self.cfg.env.depth_sensor,
+            renderInstanceSegmentation=False,
+            width=self.cfg.env.image_width,
+            height=self.cfg.env.image_height,
+            fieldOfView=79,
+            port=8200 + self._worker_id,
+        )
+
+        skip_cloud = os.environ.get("SEE2SEEK_NO_CLOUD_RENDERING", "")
+        if (
+            not self._render
+            and not skip_cloud
+            and not getattr(self, "_cloud_rendering_broken", False)
+        ):
+            try:
+                self._controller = Controller(
+                    **base_kwargs,
+                    headless=True,
+                    gpu_device=0,
+                    platform=CloudRendering,
+                )
+                event = self._controller.reset(scene="FloorPlan_Train1_1")
+                for _ in range(10):
+                    if event.frame is not None:
+                        break
+                    time.sleep(0.5)
+                    event = self._controller.step(action="Pass")
+                if event.frame is not None:
+                    logger.info(f"RoboTHOREnv[{self._worker_id}] using CloudRendering (GPU Vulkan)")
+                    return
+                logger.warning(
+                    f"RoboTHOREnv[{self._worker_id}] CloudRendering produced no frame "
+                    f"— falling back to default (CPU) renderer. "
+                    f"Install NVIDIA Vulkan ICD for GPU rendering: "
+                    f"sudo apt install libnvidia-vulkan-icd"
+                )
+                self._controller.stop()
+            except Exception as e:
+                logger.warning(
+                    f"RoboTHOREnv[{self._worker_id}] CloudRendering init failed: {e} "
+                    f"— falling back to default (CPU) renderer"
+                )
+                if self._controller is not None:
+                    try:
+                        self._controller.stop()
+                    except Exception:
+                        pass
+            self._cloud_rendering_broken = True
+
+        self._controller = Controller(**base_kwargs)
+
+    def _restart_controller(self) -> None:
+        """
+        Tear down a dead/unresponsive AI2-THOR controller and start a fresh
+        one on the same port.
+
+        Called when a controller RPC raises one of
+        `_CONTROLLER_DEAD_EXCEPTIONS`, indicating the backing Unity
+        subprocess has crashed and the FIFO pipe to it is broken. Any
+        exception from `.stop()` on the old (already-dead) controller is
+        swallowed — there is nothing meaningful left to clean up on that
+        side, and we don't want a failed shutdown to mask the restart.
+        """
+        logger.warning(
+            f"RoboTHOREnv[{self._worker_id}] AI2-THOR controller appears to have "
+            f"crashed — restarting Unity backend on port {8200 + self._worker_id} ..."
+        )
+        if self._controller is not None:
+            try:
+                self._controller.stop()
+            except Exception:
+                pass
+            self._controller = None
+
+        self._init_controller()
+        logger.info(f"RoboTHOREnv[{self._worker_id}] controller restarted successfully.")
+
+    @staticmethod
+    def _load_episodes(
+        path: str,
+        episode_ids: list[str] | None = None,
+    ) -> list[dict]:
+        """
+        Load episode definitions from either:
+          - a single .json / .json.gz file, or
+          - a directory containing one or more per-scene .json/.json.gz files.
+
+        When a directory is given and a scene has BOTH a .json and a .json.gz
+        version (as in the debug set), only the .json.gz is loaded so episodes
+        aren't duplicated.
+        """
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Episodes path not found: {path}")
+
+        def _read_one(fp: str) -> list[dict]:
+            if fp.endswith(".gz"):
+                with gzip.open(fp, "rt", encoding="utf-8") as f:
+                    data = json.load(f)
+            else:
+                with open(fp) as f:
+                    data = json.load(f)
+
+            if isinstance(data, list):
+                return data
+            elif isinstance(data, dict):
+                return data.get("episodes", [data])
+            else:
+                raise ValueError(f"Unexpected JSON data format in {fp}. Expected list or dict.")
+
+        episodes: list[dict] = []
+
+        if os.path.isdir(path):
+            # stem -> filepath, preferring .json.gz over .json for the same stem
+            files: dict[str, str] = {}
+            for fname in sorted(os.listdir(path)):
+                if fname.endswith(".json.gz"):
+                    stem = fname[: -len(".json.gz")]
+                    files[stem] = os.path.join(path, fname)
+            for fname in sorted(os.listdir(path)):
+                if fname.endswith(".json") and not fname.endswith(".json.gz"):
+                    stem = fname[: -len(".json")]
+                    files.setdefault(
+                        stem, os.path.join(path, fname)
+                    )  # skip if .gz already claimed it
+
+            if not files:
+                raise FileNotFoundError(
+                    f"No .json/.json.gz episode files found in directory: {path}"
+                )
+
+            for fp in files.values():
+                episodes.extend(_read_one(fp))
+        else:
+            episodes.extend(_read_one(path))
+
+        # Filter by specific IDs if requested
+        if episode_ids is not None:
+            episode_ids_set = set(episode_ids)
+            episodes = [e for e in episodes if e.get("id") in episode_ids_set]
+
+        if len(episodes) == 0:
+            raise ValueError(f"No valid episodes found in {path}")
+
+        return episodes
+
+    # =======================================================================
+    # Gym Environment Core Interface Methods
+    # =======================================================================
+    def reset(self) -> dict[str, torch.Tensor]:
+        """
+        Reset to a new dataset scenario trajectory.
+
+        Resilient to "bad" episodes whose starting pose collides with a
+        static object in the scene (TeleportFull -> lastActionSuccess=False)
+        or whose renderer fails to produce a frame. Such episodes are
+        skipped in favor of the next one in the shuffled queue, up to
+        `_max_reset_retries` consecutive attempts, instead of raising and
+        killing the worker subprocess.
+
+        Evaluation uses a finite queue instead: a rejected TeleportFull raises
+        InvalidEpisodeStart so the caller can report its ID and exclude it from
+        metrics. Renderer failures remain errors; exhausted shards raise StopIteration.
+
+        Also resilient to the controller itself being dead (e.g. called
+        right after a mid-episode Unity crash during step()): a
+        BrokenPipeError/OSError here triggers a controller restart and a
+        retry of the same reset attempt, without consuming one of the
+        "bad episode" retries.
+
+        Returns:
+            obs: dict tracking keys:
+                "rgb":  (3, H, W) live camera float view tensor
+                "goal": (512,) precalculated float embedding target vector
+        """
+        last_error: str | None = None
+        controller_restarts = 0
+
+        attempt = 0
+        while attempt < self._max_reset_retries:
+            if self._episode_index >= len(self._episodes):
+                if self._evaluation:
+                    raise StopIteration("Evaluation episode shard exhausted")
+                self._rng.shuffle(self._episodes)
+                self._episode_index = 0
+
+            self._current_episode = self._episodes[self._episode_index]
+            self._episode_index += 1
+            self._num_steps = 0
+            self._episode_collisions = 0
+
+            ep = self._current_episode
+            scene = ep["scene"]
+
+            try:
+                # 1. Reset simulator framework window state target
+                event = self._controller.reset(scene=scene)
+
+                # CloudRendering's Vulkan render server can take several seconds
+                # to warm up, especially when many workers start simultaneously.
+                # Poll with exponential backoff until a real frame arrives.
+                retries = 0
+                max_retries = 30
+                while event.frame is None and retries < max_retries:
+                    time.sleep(min(0.2 * (1.3**retries), 2.0))
+                    event = self._controller.step(action="Pass")
+                    retries += 1
+
+                if event.frame is None:
+                    last_error = f"Renderer failed to produce a frame after {retries} retries (scene={scene})"
+                    if self._evaluation:
+                        raise RuntimeError(last_error)
+                    logger.warning(f"{last_error} — skipping to next episode")
+                    attempt += 1
+                    continue
+                elif retries > 0:
+                    logger.info(
+                        f"RoboTHOREnv[{self._worker_id}] renderer warmed up after {retries} retries (scene={scene})"
+                    )
+
+                # 2. Build rotation payload matching AI2-THOR API parameters (Yaw mapping)
+                start_rotation = {"x": 0, "y": ep.get("initial_orientation", 0.0), "z": 0}
+
+                event = self._controller.step(
+                    action="TeleportFull",
+                    position=ep["initial_position"],
+                    rotation=start_rotation,
+                    horizon=ep.get("initial_horizon", 0),
+                )
+            except _CONTROLLER_DEAD_EXCEPTIONS as e:
+                # Unity died during reset itself. Restart the controller and
+                # retry this same episode attempt (don't burn a "bad episode"
+                # retry on what is really a backend crash).
+                controller_restarts += 1
+                if controller_restarts > self._max_controller_restarts:
+                    raise ControllerCrashError(
+                        f"RoboTHOREnv[{self._worker_id}] controller crashed "
+                        f"{controller_restarts} times during reset(); giving up. "
+                        f"Last error: {type(e).__name__}: {e}"
+                    ) from e
+                self._restart_controller()
+                self._episode_index -= 1  # re-try the same episode, don't skip it
+                continue
+
+            if not event.metadata.get("lastActionSuccess", True):
+                last_error = (
+                    f"TeleportFull failed for episode={ep.get('id', '?')} scene={scene}, "
+                    f"position={ep['initial_position']}, rotation={start_rotation}: "
+                    f"{event.metadata.get('errorMessage')}"
+                )
+                if self._evaluation:
+                    raise InvalidEpisodeStart(
+                        ep, last_error, self._compute_path_length(ep["shortest_path"])
+                    )
+                logger.warning(f"{last_error} — skipping to next episode")
+                attempt += 1
+                continue
+
+            if event.frame is None:
+                last_error = f"TeleportFull succeeded but returned no frame (scene={scene})"
+                if self._evaluation:
+                    raise RuntimeError(last_error)
+                logger.warning(f"{last_error} — skipping to next episode")
+                attempt += 1
+                continue
+
+            # 3. Calculate distance tracking metrics relative to final waypoint destination coordinate proxy
+
+            goal_pos = ep["shortest_path"][-1]
+            self._prev_geodesic_dist = self._get_geodesic_distance(goal_pos)
+
+            # 3a. Goal heading from optimal_goal_pose (for angle-to-goal reward)
+            optimal_pose = ep.get("optimal_goal_pose", {})
+            self._goal_heading = optimal_pose.get("rotation", 0.0)
+            agent_heading = event.metadata["agent"]["rotation"]["y"]
+            self._prev_angle_to_goal = self._angular_distance(agent_heading, self._goal_heading)
+
+            # 3b. SPL bookkeeping: L = shortest-path length (sum of segment
+            # lengths along the precomputed shortest_path waypoints), and
+            # P = distance actually traveled this episode (accumulated in
+            # step(), reset here to 0).
+            self._shortest_path_length = self._compute_path_length(ep["shortest_path"])
+            self._path_length = 0.0
+            self._last_agent_pos = dict(ep["initial_position"])
+
+            # 3c. Reset exploration tracking
+            self._visited_cells = set()
+            start_cell = self._pos_to_cell(ep["initial_position"])
+            self._visited_cells.add(start_cell)
+
+            # 4. Fetch the environment state observations
+            rgb = self._get_rgb_tensor(event.frame)
+            goal_embedding = self._load_goal_embedding(ep)
+            pointgoal = self._compute_pointgoal()
+
+            return {"rgb": rgb, "goal": goal_embedding, "pointgoal": pointgoal}
+
+        # Exhausted all retries — this indicates a systemic problem
+        # (e.g. bad dataset path, corrupted episode file) rather than a
+        # single unlucky spawn, so we raise here.
+        raise RuntimeError(
+            f"RoboTHOREnv[{self._worker_id}] failed to reset after "
+            f"{self._max_reset_retries} consecutive attempts. "
+            f"Last error: {last_error}"
+        )
+
+    def step(self, action: int) -> tuple[dict[str, torch.Tensor], float, bool, dict[str, Any]]:
+        """
+        Executes a control navigation step command.
+
+        If the AI2-THOR/Unity backend has crashed (pipe broken), the
+        controller is restarted and a fresh episode is started via
+        reset(). The transition returned in that case is a synthetic
+        episode boundary: reward=0.0, done=True,
+        info["controller_crashed"]=True — the trainer's rollout buffer
+        should treat it exactly like any other episode-terminal step
+        (value bootstrapping for a done=True step is already a no-op in
+        standard PPO/GAE implementations).
+        """
+        assert 0 <= action < len(ACTIONS), f"Action index bounds error: {action}"
+        assert self._current_episode is not None
+
+        self._num_steps += 1
+        action_name = ACTIONS[action]
+
+        try:
+            if action_name == "Stop":
+                done, success, stop_dist = self._handle_stop()
+                if success:
+                    reward = self.cfg.env.success_reward
+                    # Angle-success bonus: facing goal heading within threshold
+                    agent_heading = self._controller.last_event.metadata["agent"]["rotation"]["y"]
+                    angle_diff = self._angular_distance(agent_heading, self._goal_heading)
+                    if angle_diff <= self.cfg.env.angle_success_threshold:
+                        reward += self.cfg.env.angle_success_reward
+                elif self.cfg.env.shaped_stop:
+                    ratio = min((stop_dist - self.cfg.env.success_distance) / 4.0, 1.0)
+                    reward = self.cfg.env.failed_stop_penalty * ratio
+                else:
+                    reward = self.cfg.env.failed_stop_penalty
+                info = self._build_info(success, done)
+                goal_tensor = self._get_cached_goal()
+                assert goal_tensor is not None
+                obs = {
+                    "rgb": self._get_rgb_tensor(self._controller.last_event.frame),
+                    "goal": goal_tensor,
+                    "pointgoal": self._compute_pointgoal(),
+                }
+                return obs, reward, done, info
+
+            event = self._controller.step(action=action_name)
+        except _CONTROLLER_DEAD_EXCEPTIONS as e:
+            return self._recover_from_controller_crash(action_name, e)
+
+        # Accumulate traveled path length (only counts actual displacement,
+        # so failed/blocked moves that don't change position contribute ~0).
+        agent_pos = event.metadata["agent"]["position"]
+        self._path_length += float(
+            np.linalg.norm(
+                [
+                    agent_pos["x"] - self._last_agent_pos["x"],
+                    agent_pos["z"] - self._last_agent_pos["z"],
+                ]
+            )
+        )
+        self._last_agent_pos = dict(agent_pos)
+
+        if not event.metadata.get("lastActionSuccess", True):
+            logger.warning(
+                f"Action '{action_name}' failed at step {self._num_steps} "
+                f"(episode={self._current_episode.get('id', '?')}): "
+                f"{event.metadata.get('errorMessage')}"
+            )
+
+        goal_pos = self._current_episode["shortest_path"][-1]
+        # Bug 5 fix: only recompute geodesic distance when position actually
+        # changed (successful MoveAhead). Rotations and failed moves don't
+        # change position, so the cached value is exact — saves one Unity RPC
+        # per step on ~60-70% of actions.
+        if action_name == "MoveAhead" and event.metadata.get("lastActionSuccess", True):
+            curr_dist = self._get_geodesic_distance(goal_pos)
+        else:
+            curr_dist = self._prev_geodesic_dist
+
+        raw_shaping = (self._prev_geodesic_dist - curr_dist) * self.cfg.env.geodesic_reward_scale
+        # Clip to a sane per-step range — one MoveAhead step is ~0.25m, so a
+        # single step's shaping reward should never plausibly need to exceed
+        # roughly that scale. Guards against any residual distance-metric
+        # noise (e.g. waypoint-index jumps) from dominating the reward.
+        raw_shaping = float(np.clip(raw_shaping, -1.0, 1.0))
+
+        reward = raw_shaping
+        reward += self.cfg.env.slack_reward
+
+        # Angle-to-goal shaping: only active within success_distance (1m)
+        # Encourages the agent to face the goal heading before calling Stop
+        if curr_dist <= self.cfg.env.success_distance:
+            agent_heading = event.metadata["agent"]["rotation"]["y"]
+            curr_angle = self._angular_distance(agent_heading, self._goal_heading)
+            angle_delta = (self._prev_angle_to_goal - curr_angle) / 180.0  # normalize to [-1, 1]
+            reward += angle_delta * self.cfg.env.angle_reward_scale
+            self._prev_angle_to_goal = curr_angle
+
+        if action_name == "MoveAhead":
+            if not event.metadata.get("lastActionSuccess", True):
+                reward += self.cfg.env.collision_penalty
+                self._episode_collisions += 1
+        elif action_name in {"RotateLeft", "RotateRight"}:
+            reward += self.cfg.env.rotation_penalty
+
+        # Intrinsic exploration bonus for visiting new grid cells
+        if self._exploration_bonus > 0:
+            cell = self._pos_to_cell(agent_pos)
+            if cell not in self._visited_cells:
+                self._visited_cells.add(cell)
+                reward += self._exploration_bonus
+
+        self._prev_geodesic_dist = curr_dist
+
+        done = self._num_steps >= self._effective_max_steps
+        if done:
+            reward += self.cfg.env.timeout_penalty
+
+        info = self._build_info(success=False, done=done)
+        info["move_success"] = (
+            event.metadata.get("lastActionSuccess", True) if action_name == "MoveAhead" else True
+        )
+
+        goal_tensor = self._get_cached_goal()
+        assert goal_tensor is not None
+        obs = {
+            "rgb": self._get_rgb_tensor(event.frame),
+            "goal": goal_tensor,
+            "pointgoal": self._compute_pointgoal(),
+        }
+        return obs, reward, done, info
+
+    def _recover_from_controller_crash(
+        self, action_name: str, exc: Exception
+    ) -> tuple[dict[str, torch.Tensor], float, bool, dict[str, Any]]:
+        """
+        Handle a dead-controller exception raised mid-step: restart Unity,
+        start a fresh episode, and return a synthetic terminal transition
+        so the caller (VecEnv worker / trainer) sees a clean episode
+        boundary rather than a propagating exception.
+
+        Raises ControllerCrashError if the controller cannot be brought
+        back up within `_max_controller_restarts` attempts — at that
+        point something systemic (e.g. persistent GPU OOM) is going on
+        and it's better to fail loudly than restart-loop forever.
+        """
+        episode_id = self._current_episode.get("id", "?") if self._current_episode else "?"
+        logger.error(
+            f"RoboTHOREnv[{self._worker_id}] controller/backend crashed while executing "
+            f"'{action_name}' at step {self._num_steps} (episode={episode_id}): "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+        restarts = 0
+        while restarts < self._max_controller_restarts:
+            restarts += 1
+            try:
+
+                self._restart_controller()
+                obs = self.reset()
+                info = {
+                    "success": False,
+                    "done": True,
+                    "num_steps": self._num_steps,
+                    "episode_id": episode_id,
+                    "scene_id": (
+                        self._current_episode.get("scene", "?") if self._current_episode else "?"
+                    ),
+                    "collisions": self._episode_collisions,
+                    "controller_crashed": True,
+                }
+                return obs, 0.0, True, info
+            except _CONTROLLER_DEAD_EXCEPTIONS as e:
+                logger.warning(
+                    f"RoboTHOREnv[{self._worker_id}] controller restart attempt "
+                    f"{restarts}/{self._max_controller_restarts} failed: {type(e).__name__}: {e}"
+                )
+                exc = e
+
+        raise ControllerCrashError(
+            f"RoboTHOREnv[{self._worker_id}] could not recover controller after "
+            f"{self._max_controller_restarts} restart attempts. Last error: "
+            f"{type(exc).__name__}: {exc}. This usually means something systemic "
+            f"(e.g. persistent GPU OOM) rather than a one-off crash — check "
+            f"`nvidia-smi` / `dmesg` for OOM-killer activity."
+        ) from exc
+
+    def close(self) -> None:
+        if self._controller is not None:
+            self._controller.stop()
+            self._controller = None
+
+    # =======================================================================
+    # Internal Pipeline Helper Functions
+    # =======================================================================
+    @staticmethod
+    def _angular_distance(angle_a: float, angle_b: float) -> float:
+        """Minimum angular distance between two angles in degrees (0-180)."""
+        diff = abs((angle_a % 360) - (angle_b % 360))
+        return min(diff, 360 - diff)
+
+    def _handle_stop(self) -> tuple[bool, bool, float]:
+        """Validates stopping threshold distance criteria against the final target path node."""
+        assert self._current_episode is not None
+        goal_pos = self._current_episode["shortest_path"][-1]
+        agent_pos = self._controller.last_event.metadata["agent"]["position"]
+
+        dist = float(
+            np.linalg.norm(
+                [
+                    agent_pos["x"] - goal_pos["x"],
+                    agent_pos["z"] - goal_pos["z"],
+                ]
+            )
+        )
+        success = dist <= self.cfg.env.success_distance
+        return True, success, dist
+
+    def _compute_pointgoal(self) -> torch.Tensor:
+        """
+        Compute the PointGoal sensor: [geodesic_distance, cos(angle), sin(angle)].
+
+        angle is the relative bearing from the agent's current facing direction
+        to the straight-line direction toward the goal (in radians).
+        """
+        assert self._current_episode is not None
+        agent_meta = self._controller.last_event.metadata["agent"]
+        agent_pos = agent_meta["position"]
+        agent_rot_y = agent_meta["rotation"]["y"]
+        goal_pos = self._current_episode["shortest_path"][-1]
+
+        dx = goal_pos["x"] - agent_pos["x"]
+        dz = goal_pos["z"] - agent_pos["z"]
+        goal_angle_deg = np.degrees(np.arctan2(dx, dz)) % 360
+        facing_deg = agent_rot_y % 360
+
+        relative_angle_deg = goal_angle_deg - facing_deg
+        if relative_angle_deg > 180:
+            relative_angle_deg -= 360
+        elif relative_angle_deg < -180:
+            relative_angle_deg += 360
+
+        relative_angle_rad = np.radians(relative_angle_deg)
+
+        return torch.tensor(
+            [
+                self._prev_geodesic_dist,
+                np.cos(relative_angle_rad),
+                np.sin(relative_angle_rad),
+            ],
+            dtype=torch.float32,
+        )
+
+    def _get_geodesic_distance(self, goal_pos: dict) -> float:
+        """
+        True geodesic distance via AI2-THOR's native pathfinding engine
+        (GetShortestPathToPoint), called directly via controller.step()
+        rather than through ai2thor.util.metrics.get_shortest_path_to_point,
+        whose argument packaging doesn't match this AI2-THOR version's
+        actual action signature.
+
+        Verified signature for this build: `position` takes the start point
+        as a Vector3 dict, and the target is passed as flat `x`/`y`/`z`
+        kwargs (NOT a nested `target` dict) — confirmed via a standalone
+        controller.step() smoke test against GetReachablePositions output.
+        """
+        assert self._current_episode is not None
+        agent_pos = self._controller.last_event.metadata["agent"]["position"]
+
+        try:
+            event = self._controller.step(
+                action="GetShortestPathToPoint",
+                position=agent_pos,
+                target=goal_pos,
+                allowedError=0.05,
+            )
+            if not event.metadata.get("lastActionSuccess", False):
+                raise ValueError(event.metadata.get("errorMessage", "unknown error"))
+
+            corners = event.metadata["actionReturn"]["corners"]
+            return float(path_distance(corners))
+
+        except (ValueError, KeyError) as e:
+            logger.warning(
+                f"GetShortestPathToPoint failed at step {self._num_steps} "
+                f"(episode={self._current_episode.get('id', '?')}): {e} "
+                f"— falling back to Euclidean distance for this step."
+            )
+            return float(
+                np.linalg.norm(
+                    [
+                        agent_pos["x"] - goal_pos["x"],
+                        agent_pos["z"] - goal_pos["z"],
+                    ]
+                )
+            )
+
+    def _compute_path_length(self, waypoints: list[dict]) -> float:
+        """Sum consecutive XZ-plane distances along the shortest_path waypoint list."""
+        if len(waypoints) < 2:
+            return 0.0
+        total = 0.0
+        for a, b in zip(waypoints[:-1], waypoints[1:]):
+            total += float(np.linalg.norm([a["x"] - b["x"], a["z"] - b["z"]]))
+        return total
+
+    def _get_rgb_tensor(self, frame: np.ndarray | None = None) -> torch.Tensor:
+        """
+        Convert a raw AI2-THOR RGB frame (HxWx3 uint8 array) into a
+        normalized model-ready tensor.
+
+        Args:
+            frame: Optional frame array. If not provided, falls back to
+                self._controller.last_event.frame (kept for backward
+                compatibility with any other call sites).
+        """
+        if frame is None:
+            frame = self._controller.last_event.frame
+
+        if frame is None:
+            raise RuntimeError(
+                "Controller returned no frame — renderer may not be initialised "
+                "or the last action may have failed silently."
+            )
+
+        pil = Image.fromarray(frame)
+        return self._transform(pil)
+
+    def _load_goal_embedding(self, ep: dict) -> torch.Tensor:
+        """
+        Resolves embedding references against the registry map.
+
+        Confirmed key format (verified against embeddings.pt on 2026-07-10):
+            "<split>/images/<basename of goal_image_path>"
+        e.g. "debug/images/id_000000_FloorPlan_Train1_1_..._goal.png"
+
+        Requires cfg.env.split to match the actual split folder name
+        (e.g. "debug") — the default in config.py is "train", so make sure
+        it's overridden for debug runs or this will raise KeyError below.
+        """
+        if self._text_goals is not None:
+            self._cached_goal_embedding = self._text_goals[ep["object_type"]]
+            return self._cached_goal_embedding
+        filename = os.path.basename(ep.get("goal_image_path", ""))
+        lookup_key = f"{self._split}/images/{filename}"
+
+        if lookup_key not in self._embeddings_registry:
+            raise KeyError(
+                f"Goal embedding key '{lookup_key}' not found in embeddings registry. "
+                f"Check that cfg.env.split ('{self._split}') matches the actual split "
+                f"folder name, and that goal_image_path in the episode data is correct."
+            )
+
+        self._cached_goal_embedding = self._embeddings_registry[lookup_key]
+        return self._cached_goal_embedding
+
+    def _get_cached_goal(self) -> torch.Tensor | None:
+        return self._cached_goal_embedding
+
+    def _build_info(self, success: bool, done: bool) -> dict[str, Any]:
+        spl = 0.0
+        assert self._current_episode is not None
+        if success and self._shortest_path_length > 0:
+            spl = self._shortest_path_length / max(self._path_length, self._shortest_path_length)
+
+        return {
+            "success": success,
+            "done": done,
+            "spl": spl,
+            "num_steps": self._num_steps,
+            "episode_id": self._current_episode.get("id", "?"),
+            "scene_id": self._current_episode.get("scene", "?"),
+            "collisions": self._episode_collisions,
+            "path_length": round(self._path_length, 3),
+            "shortest_path_length": round(self._shortest_path_length, 3),
+        }
+
+    def set_max_steps(self, max_steps: int) -> None:
+        """Update effective max_steps (called by trainer for curriculum scheduling)."""
+        self._effective_max_steps = max_steps
+
+    def set_exploration_bonus(self, bonus: float) -> None:
+        """Update exploration bonus (called by trainer for decay scheduling)."""
+        self._exploration_bonus = bonus
+
+    def _pos_to_cell(self, pos: dict) -> tuple[int, int]:
+        """Discretize an (x, z) position into a grid cell."""
+        cx = int(pos["x"] / self._cell_size)
+        cz = int(pos["z"] / self._cell_size)
+        return (cx, cz)
+
+    # =======================================================================
+    # Environment Class Attribute Space Properties
+    # =======================================================================
+    @property
+    def observation_space_shape(self) -> tuple[int, int, int]:
+        return (
+            self.cfg.env.image_channels,
+            self.cfg.env.image_height,
+            self.cfg.env.image_width,
+        )
+
+    @property
+    def num_actions(self) -> int:
+        return self.cfg.env.num_actions
