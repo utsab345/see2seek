@@ -5,9 +5,19 @@ encoders with a recurrent **PPO** policy and episodic spatial memory. Trained
 on ImageNav (image goals); transfers zero-shot to ObjectNav (CLIP text-encoded
 object goals) with no additional training.
 
+**Why "See2Seek"?** The agent *sees* a goal — an image in ImageNav, a text
+label in ObjectNav — and then *seeks* it out in the environment. The same
+frozen CLIP embedding space covers both goal modalities.
+
 [![CI](https://github.com/utsab345/see2seek/actions/workflows/ci.yml/badge.svg)](https://github.com/utsab345/see2seek/actions)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)]()
 [![MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+
+![System Architecture](docs/system_architecture.png)
+
+*Figure 1 — end-to-end architecture: frozen DINOv2/CLIP encoders, trainable
+spatial CNN and projection heads, pose-conditioned episodic memory, and the
+2-layer GRU policy that fuses them into a multimodal state.*
 
 ---
 
@@ -30,15 +40,21 @@ object goals) with no additional training.
   disabled branches are stripped from the architecture and GRU input, and every
   variant is resumable and reproducible.
 
+> **First, an honest caveat.** The numbers below are single-run point
+> estimates. Repeated-seed standard deviations, hardware, wall-clock time, and
+> baseline comparisons are not measured yet — treat the small ImageNav vs.
+> ObjectNav gap (≈ 1.6 pp overall SR) as indicative rather than conclusive.
+> See [Future work](#future-work).
+
 ## Results
 
 Trained for 10M steps. Difficulty is the oracle shortest-path distance:
 easy ≤ 3 m, medium 3–6 m, hard > 6 m.
 
-| Task | Overall SR | Overall SPL | Easy SR | Hard SR |
-|------|-----------:|------------:|--------:|--------:|
-| ImageNav | 15.4% | 0.094 | 23.1% | 5.7% |
-| ObjectNav (zero-shot) | 17.0% | 0.108 | 27.4% | 5.1% |
+| Task | Overall SR | Overall SPL | Easy SR | Medium SR | Hard SR |
+|------|-----------:|------------:|--------:|----------:|--------:|
+| ImageNav | 15.4% | 0.094 | 23.1% | 8.7% | 5.7% |
+| ObjectNav (zero-shot) | 17.0% | 0.108 | 27.4% | 8.2% | 5.1% |
 
 ObjectNav's higher overall SR is driven almost entirely by easy episodes
 (27.4% vs 23.1%). On medium and hard episodes it trails ImageNav
@@ -46,8 +62,49 @@ ObjectNav's higher overall SR is driven almost entirely by easy episodes
 close range but does not produce sustained goal-directed long-horizon
 navigation.
 
+**ObjectNav prompt format.** Object goals are fixed, templated English class
+phrases resolved per target *category* (e.g. `"a laptop"`), shared by every
+instance of that category — not per-instance descriptions
+(`evaluation/evaluator.py`, `_get_category_map`).
+
+### Experimental setup
+
+- **Seed** — single default `Config.seed = 42`; each simulator worker derives
+  its RNG as `seed + worker_id`.
+- **Training** — 10M environment steps; max-steps curriculum 150 → 500 over
+  the first 3M steps (see [Configuration](#configuration)).
+- **Evaluation** — each validation episode is visited once per task; metrics
+  are point estimates without confidence intervals.
+- **Difficulty buckets** — oracle shortest-path ≤ 3 m (easy), 3–6 m (medium),
+  > 6 m (hard).
+
+## Contributions
+
+**Reproduced / reused.** Frozen CLIP and DINOv2 encoders (unmodified); PPO
+(Schulman et al., 2017) with standard hyperparameters; RoboTHOR ImageNav and
+ObjectNav episode definitions as in ZSON (Majumdar et al., 2022).
+
+**New in this project.**
+
+- **A frozen-encoder recurrent policy for ImageNav** — only the spatial CNN,
+  projection heads, episodic memory, and 2-layer GRU are trained.
+- **Zero-shot image→text goal transfer in RoboTHOR** — a single policy
+  navigates to CLIP text-embedded object categories with no ObjectNav training.
+- **Pose-conditioned episodic memory without backprop-through-time** — a
+  128-slot rolling buffer of detached CLS tokens read out by cross-attention;
+  memory trains online, with no truncated BPTT.
+- **Controlled ablations of ego-pose and memory** — disabled branches are
+  stripped from the model and the GRU input dimension (not merely zero-masked),
+  see [the ablation reference](#ablation-reference-gru-input).
+- **An end-to-end reproducible framework** — typed configs, dataset tooling,
+  train/eval scripts, and CI-gated tests that run without a GPU or simulator.
+
+These components are deliberately independent so each one's causal contribution
+can be isolated (see [Future work](#future-work)).
+
 ## Contents
 
+- [Contributions](#contributions)
 - [Installation](#installation)
 - [Quickstart](#quickstart)
 - [Architecture](#architecture)
@@ -56,8 +113,11 @@ navigation.
 - [Reward function](#reward-function)
 - [Metrics](#metrics)
 - [Dataset](#dataset)
+- [Reproducibility](#reproducibility)
 - [Development](#development)
 - [Trajectory examples](#trajectory-examples)
+- [Limitations](#limitations)
+- [Future work](#future-work)
 - [References](#references)
 
 ## Installation
@@ -83,10 +143,10 @@ python scripts/train.py --debug
 # Resume from checkpoint
 python scripts/train.py --resume data_dino_v7/checkpoints/checkpoint_000010000000.pth
 
-# Evaluate ImageNav polymer
+# Evaluate ImageNav
 python scripts/eval.py --checkpoint data_dino_v7/checkpoints/checkpoint_final.pth --task imagenav
 
-# Zero-shot ObjectNav (CLIP text goal, no GPS)
+# Zero-shot ObjectNav (CLIP text goal; dead-reckoned ego-pose is still used)
 python scripts/eval.py --checkpoint data_dino_v7/checkpoints/checkpoint_final.pth --task objectnav
 
 # Bird's-eye trajectory visualization
@@ -114,7 +174,7 @@ change). See [Ablation reference](#ablation-reference-gru-input).
 
 ## Architecture
 
-![System Architecture](docs/system_architecture.png)
+See Figure 1 above for the full data flow. Branch table:
 
 | Branch | Source | Output dim | Trainable |
 |--------|--------|-----------:|:---------:|
@@ -134,10 +194,14 @@ and GRU are trainable.
 **Episodic memory** stores the last 128 CLS tokens in a rolling buffer with
 pose-conditioned cross-attention readout. Stored tokens are detached (no BPTT
 through time), resets at episode boundaries, and gives the agent a
-"have I been here before?" signal without explicit map construction.
+"have I been here before?" signal. This is a coarse, queryable *place* memory,
+**not** a metric/occupancy map: the policy never plans shortest paths over it,
+and the buffer only shapes revisiting behaviour through attention.
 
-**Ego-pose** is dead-reckoned from discrete actions and updated only on
-successful moves (collision-aware), so it is immune to wall failures.
+**Ego-pose** is a local, dead-reckoned odometry signal (there is **no GPS/global
+positioning**): `[x, y, cosθ, sinθ]` is integrated from discrete actions and
+updated only on successful moves, so it is immune to wall failures but drifts
+on long horizons.
 
 ### Ablation reference (GRU input)
 
@@ -225,18 +289,65 @@ orientation before `Stop`.
 
 ## Dataset
 
-The dataset is **not** bundled. Build it with the tooling under
-`see2seek/utils/`:
+The dataset is **not bundled** (RoboTHOR scenes and per-scene episode files are
+large). Build it in four stages with the tooling under `see2seek/utils/`:
 
-- `generate_data.py` — scrape/mint RoboTHOR episodes with shortest paths
-- `filter_episodes.py` — drop degenerate episodes (e.g. shortest path ≤ 1.5 m,
-  ~18% of the original set)
-- `augment_goal_angles.py` — augment goal headings
-- `image2vec.py` — pre-cache CLIP goal embeddings
+1. **Generate episodes** — `generate_data.py` converts RoboTHOR `*.json.gz`
+   episode dumps into per-scene episode JSON for the `debug`, `train`, and
+   `val` splits. It takes no CLI args: set `INPUT_DATASET_DIR` and
+   `OUTPUT_DATASET_DIR` at the top of the file, then run
+   `python -m see2seek.utils.generate_data`.
 
-Then point `env.scene_dataset_path` and `env.episodes_path` at it (or pass
-`--scene-dataset-path` / `--episodes-path`) so `validate_dataset_paths`
-succeeds.
+2. **Filter degenerate episodes** — drop episodes whose oracle shortest path
+   is ≤ 1.5 m (≈18% of the original set):
+   `python -m see2seek.utils.filter_episodes --dataset_dir dataset/train --dry_run`
+   (drop `--dry_run` to apply; backups of edited files are written unless
+   `--no_backup`).
+
+3. **Augment goal headings** *(optional)* — `augment_goal_angles.py` renders
+   the goal from several headings with parallel AI2-THOR instances and writes
+   an augmented `episodes/` plus `embeddings.pt`:
+   `python -m see2seek.utils.augment_goal_angles --input_dir ... --output_dir ...`.
+
+4. **Cache CLIP goal embeddings** — `image2vec.py` batch-encodes goal images
+   into `embeddings.pt` and resumes from partial runs:
+   `python -m see2seek.utils.image2vec --splits train val`.
+
+Expected layout (matches `env.scene_dataset_path` / `env.episodes_path` in
+`configs/*.yaml`):
+
+```
+dataset/
+├── train/
+│   ├── episodes/          # per-scene episode JSON files
+│   └── embeddings.pt      # cached CLIP goal embeddings (image2vec.py)
+└── val/
+    ├── episodes/
+    └── embeddings.pt
+```
+
+Point `validate_dataset_paths` at this layout (`--scene-dataset-path` /
+`--episodes-path`) and it will pass before any model or worker is started.
+
+## Reproducibility
+
+- **Known-good configuration** — `configs/train_robothor.yaml` (train) and
+  `configs/eval.yaml` (eval) are the reference overrides; the only edits
+  needed are the dataset paths they hard-code.
+- **CPU-only, no-simulator tests** — `make test` / `pytest` exercises config
+  merging, navigation metrics, and difficulty parsing in pure Python — no GPU,
+  no `ai2thor`, no downloaded weights.
+- **Ablation flags** — `--no-egopose`, `--no-episodic-memory`, and
+  `--debug` (2 envs, 2 updates, no W&B) are smoke-test paths that need no
+  dataset changes.
+- **Encoder weights** — DINOv2 (torch hub) and CLIP (open_clip) are downloaded
+  automatically on first use: DINOv2 under `~/.cache/torch/hub/checkpoints/`,
+  CLIP under the open_clip/Hugging Face cache (`~/.cache/huggingface/` by
+  default). Set `TORCH_HOME` / the cache dir to relocate them.
+- **Dependency versions** — the dev toolchain is pinned in `pyproject.toml`
+  (`ruff==0.16.7`, `black==26.5.1`, `mypy==1.14.1`); runtime dependencies use
+  lower bounds. To pin everything, export `pip freeze > requirements.lock` from
+  the exact environment that produced reported results.
 
 ## Development
 
@@ -263,10 +374,38 @@ circle = successful stop, red circle = failed stop.
 
 | | |
 |:---:|:---:|
-| ![Bowl](docs/images/trajectory_FloorPlan_Val2_4_Bowl_2.png) Bowl | ![Laptop](docs/images/trajectory_FloorPlan_Val2_2_Laptop_5.png) Laptop |
-| ![SprayBottle](docs/images/trajectory_FloorPlan_Val1_5_SprayBottle_4.png) SprayBottle | ![Mug](docs/images/trajectory_FloorPlan_Val2_2_Mug_5.png) Mug |
-| ![HousePlant](docs/images/trajectory_FloorPlan_Val1_1_HousePlant_3.png) HousePlant | ![BasketBall](docs/images/trajectory_FloorPlan_Val3_5_BasketBall_4.png) BasketBall |
-| ![Laptop](docs/images/trajectory_FloorPlan_Val2_2_Laptop_1.png) Laptop | ![Bowl](docs/images/trajectory_FloorPlan_Val3_4_Bowl_7.png) Bowl |
+| ![Bowl in FloorPlan_Val2_4](docs/images/trajectory_FloorPlan_Val2_4_Bowl_2.png)<br>Bowl · Val2_4 | ![Laptop in FloorPlan_Val2_2](docs/images/trajectory_FloorPlan_Val2_2_Laptop_5.png)<br>Laptop · Val2_2 |
+| ![SprayBottle in FloorPlan_Val1_5](docs/images/trajectory_FloorPlan_Val1_5_SprayBottle_4.png)<br>SprayBottle · Val1_5 | ![Mug in FloorPlan_Val2_2](docs/images/trajectory_FloorPlan_Val2_2_Mug_5.png)<br>Mug · Val2_2 |
+| ![HousePlant in FloorPlan_Val1_1](docs/images/trajectory_FloorPlan_Val1_1_HousePlant_3.png)<br>HousePlant · Val1_1 | ![BasketBall in FloorPlan_Val3_5](docs/images/trajectory_FloorPlan_Val3_5_BasketBall_4.png)<br>BasketBall · Val3_5 |
+| ![Laptop in FloorPlan_Val2_2](docs/images/trajectory_FloorPlan_Val2_2_Laptop_1.png)<br>Laptop · Val2_2 | ![Bowl in FloorPlan_Val3_4](docs/images/trajectory_FloorPlan_Val3_4_Bowl_7.png)<br>Bowl · Val3_4 |
+
+## Limitations
+
+- **Long-horizon performance collapses** — ImageNav success drops from 23.1%
+  (easy) to 5.7% (hard); on medium/hard episodes zero-shot ObjectNav trails the
+  task it was trained on. Dense-frontier and recursive behaviours are not
+  learned reliably past a few metres.
+- **Ego-pose drift** — pose is dead-reckoned with no metric re-localisation,
+  so heading/position error accumulates on long episodes.
+- **No metric map** — episodic memory is not an occupancy map; the policy can
+  neither plan shortest paths nor reason over explicit geometry.
+- **Simulator dependence** — all results are in RoboTHOR via `ai2thor`;
+  sim-to-real transfer is untested.
+- **Frozen encoders** — DINOv2/CLIP cannot adapt to the navigation domain, so
+  observation/goal adaptation is bounded by what the frozen embeddings already
+  encode.
+- **Single-seed point estimates** — none of the metrics carry variance or
+  baseline error bars yet.
+
+## Future work
+
+- Repeat training across ≥ 3 seeds and report mean ± std.
+- Add baselines: random policy, greedy CLIP-similarity, PPO without memory,
+  PPO without ego-pose, and trainable-encoder policies.
+- Report a full ablation table (full / no ego-pose / no memory / neither).
+- Add a lightweight metric-map head (e.g. top-down occupancy) for geo-causal
+  planning.
+- Evaluate sim-to-real in a photorealistic renderer.
 
 ## References
 
