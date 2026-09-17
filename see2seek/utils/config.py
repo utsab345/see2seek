@@ -1,0 +1,398 @@
+"""
+config.py — Central configuration dataclass for See to Seek.
+
+All hyperparameters, paths, and environment settings live here.
+Change values here rather than in individual modules so the entire
+project stays in sync. YAML overrides are loaded on top of these defaults.
+
+Architecture note (ZSON/EmbCLIP-inspired spatial fusion — see gru_policy.py):
+    Spatial branch  (trainable SpatialCompressionHead): 1568-dim
+        DINOv2 patch tokens (256 x 768, 16x16 grid) -> 2-layer CNN -> 32x7x7 -> flatten
+        1568 = 32 * 7 * 7 is a FIXED consequence of SpatialCompressionHead's
+        conv architecture (see spatial_compressed_dim below) — it is not
+        independently tunable from this config without also changing the
+        conv kernel/stride in gru_policy.py.
+    CLS branch      (trainable projection, ablatable via use_cls): 64-dim
+        DINOv2 CLS token (768) -> Linear/LayerNorm/ELU -> 64
+    Goal branch     (trainable projection): 512-dim
+        CLIP ViT-B/32 image/text embedding -> Linear/LayerNorm/ELU.
+    Previous-action branch: 32-dim
+        Learned embedding of the last discrete action.
+
+    Default fusion: 1568 spatial + 64 CLS + 512 goal + 128 memory
+                    + 32 previous action + 32 ego-pose = 2336 dimensions.
+    Optional PointGoal adds another 32 dimensions.
+
+"""
+
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+
+import torch
+
+# ---------------------------------------------------------------------------
+# Environment
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class EnvConfig:
+    """AI2-THOR / RoboTHOR environment settings."""
+
+    # --- Scene / dataset ---
+    dataset: str = "robothor"  # "robothor" or "hm3d"
+    split: str = "train"  # "train" | "val" | "test"
+    # Relative to the launch directory, not the installed package location.
+    scene_dataset_path: str = "dataset/train"
+    episodes_path: str = "dataset/train/episodes"
+
+    # --- Observation ---
+    image_width: int = 224  # must match DINOv2 expected input
+    image_height: int = 224
+    image_channels: int = 3
+    rgb_sensor: bool = True
+    depth_sensor: bool = False  # depth unused in our ablation
+
+    # --- Actions ---
+    # RoboTHOR discrete action space:
+    #   0: MoveAhead  1: RotateLeft  2: RotateRight  3: Stop
+    num_actions: int = 4
+    move_magnitude: float = 0.25  # metres per MoveAhead
+    rotate_degrees: float = 30.0  # degrees per RotateLeft/Right
+
+    # --- Reward shaping ---
+    success_reward: float = 10.0
+    angle_success_reward: float = 5.0  # bonus for stopping within 1m AND facing goal heading (±25°)
+    angle_success_threshold: float = 25.0  # degrees — max heading diff from goal for angle bonus
+    failed_stop_penalty: float = -0.5  # max penalty for calling Stop far from goal (shaped)
+    timeout_penalty: float = -2.0  # terminal penalty when episode times out (max_steps)
+    slack_reward: float = -0.005  # per-step cost (encourages efficiency)
+    geodesic_reward_scale: float = 1.5  # scale on geodesic-distance delta
+    angle_reward_scale: float = 1.0  # scale on angle-to-goal delta (only active within 1m)
+    success_distance: float = 1.0  # metres; agent is "at goal" if closer
+    collision_penalty: float = -0.01
+    rotation_penalty: float = -0.002  # fixed cost per rotation to prevent spinning
+    shaped_stop: bool = True  # if True, failed stop penalty scales with distance
+
+    # --- Intrinsic exploration reward ---
+    exploration_bonus: float = 0.10  # reward for visiting a new grid cell
+    exploration_bonus_floor: float = 0.015  # minimum bonus after decay (residual curiosity)
+    exploration_cell_size: float = 0.5  # grid cell size in metres
+    exploration_decay_steps: int = 10_000_000  # linearly decay bonus to floor over training
+
+    # --- Episode limits ---
+    max_steps: int = 500
+    min_steps_before_stop: int = 20  # don't allow Stop until this many steps
+
+    # --- Curriculum: max_steps scheduling ---
+    # max_steps ramps up during training to help the agent learn to stop early.
+    # With short episodes, the timeout penalty has strong GAE signal.
+    curriculum_enabled: bool = True
+    curriculum_start_max_steps: int = 150  # max_steps at start of training
+    curriculum_end_max_steps: int = 500  # max_steps at end of curriculum
+    curriculum_ramp_steps: int = 3_000_000  # env steps over which to ramp
+
+    # --- Parallelism ---
+    num_envs: int = 16  # number of parallel rollout workers
+
+
+# ---------------------------------------------------------------------------
+# Encoders
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class EncoderConfig:
+    """Frozen visual encoder settings + fusion architecture parameters."""
+
+    # --- Observation encoder selection ---
+    obs_encoder_type: str = "dino"  # "dino" (DINOv2 ViT-B/14) or "clip" (CLIP ViT-B/32)
+
+    # --- Observation encoder: DINOv2 ViT-B/14 ---
+    obs_encoder: str = "dinov2_vitb14"  # torch.hub model name
+    obs_embed_dim: int = 768  # DINOv2 ViT-B CLS token dim (kept
+    # for backward-compat references
+    # elsewhere; equals dino_cls_dim)
+    obs_freeze: bool = True  # always frozen; never fine-tuned
+    obs_normalize: bool = True  # ImageNet-style normalisation
+
+    # --- DINOv2 patch-token / spatial-branch settings (new) ---
+    dino_patch_dim: int = 768  # per-patch token width
+    dino_grid_size: int = 16  # 224 / 14 = 16 -> 16x16 patch grid
+    dino_cls_dim: int = 768  # CLS token width (== obs_embed_dim)
+
+    # Fixed by SpatialCompressionHead's conv architecture in gru_policy.py
+    # (Conv2d k3/s2 16->7, Conv2d k3/s1/pad1 7->7, 32 channels -> 32*7*7).
+    # Not independently overridable from here without also changing the
+    # conv layers themselves — kept as an explicit constant so
+    # policy_input_dim below stays correct and self-documenting.
+    spatial_compressed_dim: int = 1568
+
+    # --- CLS branch (trainable projection, ablatable) ---
+    cls_proj_dim: int = 64  # CLS -> small linear projection width
+    use_cls: bool = True  # ablation switch: drop CLS branch entirely
+
+    # --- Goal encoder: CLIP ViT-B/32 ---
+    goal_encoder: str = "ViT-B/32"  # open_clip model name
+    goal_embed_dim: int = 512  # CLIP image embed dim
+    goal_proj_dim: int = 512  # trainable goal projection output dim
+    goal_freeze: bool = True
+    goal_normalize: bool = True
+
+    # --- Episodic memory (attention over past CLS tokens) ---
+    use_episodic_memory: bool = True  # ablation: remove memory module and GRU branch
+    memory_size: int = 128  # rolling buffer length (past CLS tokens stored)
+    memory_proj_dim: int = 128  # output dim of memory attention readout
+
+    # --- Previous-action embedding ---
+    action_embed_dim: int = 32  # dim of learned prev-action embedding
+
+    # --- PointGoal sensor embedding ---
+    pointgoal_input_dim: int = 3  # [geodesic_dist, cos(angle), sin(angle)]
+    pointgoal_embed_dim: int = 32  # projected dim of pointgoal sensor
+    with_pointgoal: bool = False  # whether to include pointgoal sensor in GRU input
+    pointgoal_dropout: float = 0.0  # probability of zeroing pointgoal (for ObjectNav transfer)
+
+    # --- Ego-pose sensor embedding (dead-reckoned position relative to start) ---
+    egopose_input_dim: int = 4  # [x, y, cos(theta), sin(theta)]
+    egopose_embed_dim: int = 32  # projected dim of ego-pose sensor
+    use_egopose: bool = True  # whether to include ego-pose as direct GRU input
+
+    # --- CLIP obs encoder settings (used when obs_encoder_type == "clip") ---
+    clip_obs_proj_dim: int = 512  # projection dim for CLIP obs embedding
+
+    # --- Combined policy input ---
+    @property
+    def policy_input_dim(self) -> int:
+        egopose_dim = self.egopose_embed_dim if self.use_egopose else 0
+        pointgoal_dim = self.pointgoal_embed_dim if self.with_pointgoal else 0
+        memory_dim = self.memory_proj_dim if self.use_episodic_memory else 0
+        if self.obs_encoder_type == "clip":
+            return (
+                self.clip_obs_proj_dim
+                + self.goal_proj_dim
+                + memory_dim
+                + self.action_embed_dim
+                + pointgoal_dim
+                + egopose_dim
+            )
+        else:
+            cls_dim = self.cls_proj_dim if self.use_cls else 0
+            return (
+                self.spatial_compressed_dim
+                + cls_dim
+                + self.goal_proj_dim
+                + memory_dim
+                + self.action_embed_dim
+                + pointgoal_dim
+                + egopose_dim
+            )
+
+
+# ---------------------------------------------------------------------------
+# Policy / GRU
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class PolicyConfig:
+    """GRU Actor-Critic policy settings."""
+
+    hidden_size: int = 512  # GRU hidden state dimension
+    num_recurrent_layers: int = 2  # 2-layer GRU for hierarchical temporal reasoning
+    # Actor-Critic heads
+    actor_hidden_dim: int = 256  # size of intermediate linear in actor
+    critic_hidden_dim: int = 256
+
+
+# ---------------------------------------------------------------------------
+# PPO
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class PPOConfig:
+    """Proximal Policy Optimisation hyperparameters."""
+
+    # --- Rollout collection ---
+    num_steps: int = 128  # steps per rollout per env
+    # total samples per update = num_steps * num_envs = 128 * 16 = 2048
+
+    # --- Optimisation ---
+    num_epochs: int = 4  # PPO epochs per collected rollout
+    num_mini_batches: int = 2  # mini-batch splits per epoch
+    lr: float = 2.5e-4
+    eps: float = 1e-5  # Adam epsilon
+    max_grad_norm: float = 0.5
+
+    # --- GAE ---
+    gamma: float = 0.99  # discount factor
+    gae_lambda: float = 0.95  # GAE lambda
+
+    # --- PPO clipping ---
+    clip_param: float = 0.2
+    value_loss_coef: float = 0.5
+    entropy_coef: float = 0.05  # entropy bonus (used when with_pointgoal=False)
+    entropy_coef_gps_on: float = 0.02  # entropy for steps with PointGoal active
+    entropy_coef_gps_off: float = (
+        0.08  # entropy for steps with PointGoal dropped (needs exploration)
+    )
+
+    # --- Training length ---
+    total_num_steps: int = 10000000  # total env steps
+    checkpoint_interval: int = 50000  # save every N env steps
+    log_interval: int = 10  # log every N PPO updates
+
+    # --- RolloutBuffer memory knobs (new — see rollout_buffer.py docstring) ---
+    # Storing raw DINOv2 patch tokens (256 x 768 per step-env) is far larger
+    # than the old CLS-only buffer (~1.6GB at num_steps=128, num_envs=16 in
+    # fp32). buffer_store_dtype defaults to fp16 to roughly halve that.
+    # buffer_storage_device=None means "same as cfg.device"; set to
+    # torch.device("cpu") if the L4's 24GB VRAM gets tight alongside the
+    # policy/optimizer/DINOv2/CLIP footprint.
+    buffer_storage_device: Optional[torch.device] = None
+    buffer_store_dtype: torch.dtype = torch.float16
+
+
+# ---------------------------------------------------------------------------
+# Logging / Paths
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class LoggingConfig:
+    """Weights & Biases + checkpoint paths."""
+
+    use_wandb: bool = True
+    wandb_project: str = "see_to_seek"
+    wandb_entity: Optional[str] = None  # set your W&B username here
+    run_name: Optional[str] = None  # None → auto-generated
+
+    checkpoint_dir: str = "data_dino_v7/checkpoints"
+    log_dir: str = "data_dino_v7/logs"
+    video_dir: str = "videos"
+
+
+# ---------------------------------------------------------------------------
+# Data / Cache
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class DataConfig:
+    """Dataset and caching paths."""
+
+    goal_cache_dir: str = "data_dino_v7/goal_datasets"
+    # Pre-cached CLIP embeddings for ImageNav goal images
+    # generated by tools/cache_goal_embeddings.py
+    goal_cache_file: str = "data_dino_v7/goal_datasets/imagenav_robothor_clip_vitb32.pkl"
+
+
+# ---------------------------------------------------------------------------
+# Master config
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Config:
+    """
+    Top-level config aggregating all sub-configs.
+
+    Usage:
+        from configs.config import Config
+        cfg = Config()                          # all defaults
+        cfg.ppo.lr = 1e-4                      # override one field
+
+    YAML override (see configs/train_robothor.yaml):
+        from configs.config import load_config
+        cfg = load_config("configs/train_robothor.yaml")
+    """
+
+    env: EnvConfig = field(default_factory=EnvConfig)
+    encoder: EncoderConfig = field(default_factory=EncoderConfig)
+    policy: PolicyConfig = field(default_factory=PolicyConfig)
+    ppo: PPOConfig = field(default_factory=PPOConfig)
+    logging: LoggingConfig = field(default_factory=LoggingConfig)
+    data: DataConfig = field(default_factory=DataConfig)
+
+    # Reproducibility
+    seed: int = 42
+    device: str = "cuda"  # "cuda" or "cpu"
+
+
+# ---------------------------------------------------------------------------
+# YAML loader
+# ---------------------------------------------------------------------------
+
+
+def validate_dataset_paths(cfg: Config, require_image_embeddings: bool = True) -> None:
+    """Resolve data paths in the parent and fail before models/workers start."""
+    scene_path = Path(cfg.env.scene_dataset_path).expanduser().resolve()
+    episodes_path = Path(cfg.env.episodes_path).expanduser().resolve()
+    cfg.env.scene_dataset_path = str(scene_path)
+    cfg.env.episodes_path = str(episodes_path)
+
+    missing = []
+    if not scene_path.is_dir():
+        missing.append(f"dataset directory: {scene_path}")
+    if not episodes_path.exists():
+        missing.append(f"episode path: {episodes_path}")
+    elif episodes_path.is_dir() and not any(
+        p.is_file() and (p.name.endswith(".json") or p.name.endswith(".json.gz"))
+        for p in episodes_path.iterdir()
+    ):
+        missing.append(f"episode JSON files in: {episodes_path}")
+    if require_image_embeddings and not (scene_path / "embeddings.pt").is_file():
+        missing.append(f"cached image-goal embeddings: {scene_path / 'embeddings.pt'}")
+    if missing:
+        raise FileNotFoundError(
+            "Dataset is not ready:\n  "
+            + "\n  ".join(missing)
+            + "\nRun from the repository root, or set env.scene_dataset_path and "
+            "env.episodes_path in your YAML config. Training also accepts "
+            "--scene-dataset-path and --episodes-path."
+        )
+
+
+def load_config(yaml_path: str) -> Config:
+    """
+    Load a Config from YAML, deep-merging into the dataclass defaults.
+
+    The YAML file only needs to contain fields you want to override.
+
+    Args:
+        yaml_path: Path to a .yaml file (see configs/train_robothor.yaml).
+
+    Returns:
+        Config dataclass with merged values.
+    """
+
+    import yaml  # type: ignore[import-untyped]
+
+    with open(yaml_path) as f:
+        overrides = yaml.safe_load(f)
+
+    cfg = Config()
+    if overrides is None:
+        return cfg
+
+    sub_map = {
+        "env": cfg.env,
+        "encoder": cfg.encoder,
+        "policy": cfg.policy,
+        "ppo": cfg.ppo,
+        "logging": cfg.logging,
+        "data": cfg.data,
+    }
+
+    for key, value in overrides.items():
+        if key in sub_map:
+            sub_cfg = sub_map[key]
+            for k, v in value.items():
+                if hasattr(sub_cfg, k):
+                    setattr(sub_cfg, k, v)
+        elif hasattr(cfg, key):
+            setattr(cfg, key, value)
+
+    return cfg
