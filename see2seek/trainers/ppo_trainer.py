@@ -32,6 +32,7 @@ import math
 import os
 import time
 from collections import deque
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -140,6 +141,7 @@ class PPOTrainer:
         self._num_updates = 0
         self._start_time = time.time()
         self._with_pointgoal = getattr(cfg.encoder, "with_pointgoal", False)
+        self._wandb: Any = None
 
         # ---- Episode-level metric tracking (rolling window over last 100 episodes) ----
         self._recent_rewards: deque[float] = deque(maxlen=100)
